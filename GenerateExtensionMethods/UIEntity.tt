@@ -1,0 +1,27 @@
+﻿<#@ template debug="false" hostspecific="false" language="C#" #>
+<#@ import namespace="VivaLing.App.CodeGenerator.Lib" #>
+<#@ parameter type="VivaLing.App.CodeGenerator.Lib.EntityClassInfo" name="entity" #>
+namespace <#= entity.Namespace#>
+{
+	using System.Collections.Generic;
+
+	/// <summary>
+	/// Auto generated UIEntity class
+	/// </summary>
+	public class <#= entity.ClassName#>	
+	<# if(entity.Interfaces != null)
+		{ #> : <#= string.Join(",", entity.Interfaces)#> 
+	<#; 
+		}
+	#>
+	
+	{
+	<#  foreach(EntityClassPropertyInfo property in entity.Properties)
+		{ #>
+		public <#= property.PropertyType#> <#= property.PropertyName#> { get; set; }
+	<#;
+		}
+	#>
+
+	}
+}

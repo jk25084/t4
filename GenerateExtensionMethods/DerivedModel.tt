@@ -1,0 +1,320 @@
+﻿<#@ template  debug="true" hostSpecific="true" #>
+<# System.Diagnostics.Debugger.Launch(); System.Diagnostics.Debugger.Break(); #>
+<#@ output extension=".txt"  #>
+<#@ Assembly Name="System.Core" #>
+<#@ Assembly Name="System.Windows.Forms" #>
+<#@ assembly name="EnvDte" #>
+<#@ assembly name="EnvDte80" #>
+<#@ import namespace="System" #>
+<#@ import namespace="System.IO" #>
+<#@ import namespace="System.Diagnostics" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Collections" #>
+<#@ import namespace="System.Collections.Generic" #> 
+<#@ import namespace="System.Text.RegularExpressions" #>
+<#@ include file="VisualStudioHelper.ttinclude" #>
+
+last generated at <#=DateTime.Now  #> by <#= System.Environment.UserName #>
+<#
+/**********CONFIG**********/
+var scanInProjects = new []
+{
+	"VivaLing.App.CodeGenerator",
+	"VivaLing.Pattern",
+	"VivaLing.Models"
+};
+
+/**********START**********/
+var allClasses = new List<EnvDTE80.CodeClass2>();
+
+var doc = VisualStudioHelper.DTE.ActiveDocument;
+var singleMode = doc.Name.EndsWith(".cs");
+
+if(singleMode)
+{
+	allClasses.AddRange(VisualStudioHelper.CodeModel.GetAllCodeElementsOfType(doc.ProjectItem.FileCodeModel.CodeElements, EnvDTE.vsCMElement.vsCMElementClass, false).OfType<EnvDTE80.CodeClass2>());	
+}
+else 
+{
+	foreach(var project in VisualStudioHelper.GetAllProjects().Where(t => scanInProjects.Any(x => t.FullName.IndexOf(x) > -1)))
+	{
+		allClasses.AddRange(VisualStudioHelper.CodeModel.GetAllCodeElementsOfType(project.CodeModel.CodeElements, EnvDTE.vsCMElement.vsCMElementClass, false).OfType<EnvDTE80.CodeClass2>());
+	}
+}
+var attrDerivedFrom = "VivaLing.Pattern.Attributes.DerivedFromAttribute";
+var derivedMappings = new Dictionary<string, string>();
+allClasses.AsParallel().ForAll(codeclass =>
+{
+	var allAttributes = VisualStudioHelper.CodeModel.GetAllCodeElementsOfType(codeclass.Attributes, EnvDTE.vsCMElement.vsCMElementAttribute, false);
+	var attr = allAttributes.OfType<EnvDTE80.CodeAttribute2>().FirstOrDefault(att => att.FullName == attrDerivedFrom);
+	if(attr != null)
+	{
+		var attributeArgument = attr.Arguments.OfType<EnvDTE80.CodeAttributeArgument>().First();
+		string myType = Regex.Replace(attributeArgument.Value, "^typeof.*\\((.*)\\)$", "$1");
+		derivedMappings.Add(codeclass.FullName, codeclass.Namespace.FullName + "." + myType);
+    }
+});
+
+foreach(var kv in derivedMappings)
+{
+	var derivedclassFullName = kv.Key;
+	var sourceclassFullName = kv.Value;
+
+	var derivedClass = allClasses.First(t => t.FullName == derivedclassFullName);
+	// if you get errors here, the namespace of derived class must keep consistent with its source type
+	var sourceClass = allClasses.FirstOrDefault(t => t.FullName == sourceclassFullName);
+
+	if(sourceClass == null && singleMode)
+    {
+		sourceClass = VisualStudioHelper.GetCodeClass(sourceclassFullName) as EnvDTE80.CodeClass2;
+    }
+
+	if(sourceClass == null)
+    {
+		throw new Exception("Can not find class with name " + sourceclassFullName);
+    }
+	
+    try 
+    {	        
+		WalkModels(derivedClass, sourceClass);
+    }
+    catch (Exception ex)
+    {		
+        throw new Exception(derivedclassFullName, ex);
+    }	
+}
+
+VisualStudioHelper.DTE.Documents.SaveAll();
+#>
+<#+ void WalkModels(EnvDTE80.CodeClass2 derivedClass, EnvDTE80.CodeClass2 sourceClass)
+{
+	var derivedPath = derivedClass.ProjectItem.get_FileNames(0);
+	var exClassName = derivedClass.Name + "Ex";
+	var exFilePath = Path.GetDirectoryName(derivedPath) + "\\" + exClassName + ".cs";
+
+	if(!File.Exists(exFilePath))
+    {
+		using(var fs = new FileStream(exFilePath, FileMode.Create, FileAccess.ReadWrite))
+		{
+			using(var sw = new StreamWriter(fs))
+            {
+				sw.WriteLine("using System;");
+				sw.WriteLine("using System.Linq;");
+				sw.WriteLine("namespace " + derivedClass.Namespace.FullName);
+				sw.WriteLine("{");
+				sw.WriteLine("public static class " + exClassName);
+				sw.WriteLine("{");
+				sw.WriteLine(string.Format(
+				  @"private static void MannuallyFrom(this {0} @this, {1} target)
+					{{
+						// customized mapping
+					}}
+
+					private static void MannuallyTo(this {0} @this, {1} target) 
+					{{
+						// customized mapping
+					}}
+					
+					public static {0} To{2}(this {1} source)
+					{{
+						return new {0}().MapFrom(source);
+					}}
+
+					public static {1} To{3}(this {0} derived)
+					{{
+						return derived.MapTo(new {1}());
+					}}", derivedClass.FullName, sourceClass.FullName, derivedClass.Name, sourceClass.Name));
+				sw.WriteLine("}");
+				sw.WriteLine("}");
+            }
+		}
+    }
+	
+	var exProjectItem = VisualStudioHelper.NestFile(derivedClass, exFilePath);
+	var exClass = VisualStudioHelper.CodeModel.GetAllCodeElementsOfType(exProjectItem.FileCodeModel.CodeElements, EnvDTE.vsCMElement.vsCMElementClass, false).OfType<EnvDTE.CodeClass>().FirstOrDefault();
+	if(exClass == null) throw new Exception("InvalidContent in " + exFilePath);
+
+	var derivedProperties = VisualStudioHelper.CodeModel.GetAllProperties(derivedClass);
+	var sourceProperties = VisualStudioHelper.CodeModel.GetAllProperties(sourceClass);
+
+	CreateMapFrom(exClass, derivedClass, derivedProperties, sourceClass, sourceProperties);
+	CreateMapTo(exClass, derivedClass, derivedProperties, sourceClass, sourceProperties);
+
+	// format code
+	var start = exClass.GetStartPoint(EnvDTE.vsCMPart.vsCMPartHeader).CreateEditPoint();
+	var end = exClass.GetStartPoint(EnvDTE.vsCMPart.vsCMPartBody).CreateEditPoint();
+	end.EndOfDocument();
+	start.SmartFormat(end);
+}
+
+void CreateMapFrom(EnvDTE.CodeClass exClass, EnvDTE80.CodeClass2 derivedClass, IEnumerable<EnvDTE.CodeProperty> derivedProperties, EnvDTE80.CodeClass2 sourceClass, IEnumerable<EnvDTE.CodeProperty> sourceProperties)
+{
+	var methodName = "MapFrom";
+	var mapFrom = VisualStudioHelper.CodeModel.GetAllMethods(exClass)
+							.FirstOrDefault(f => f.FullName.EndsWith(exClass.Name + "." + methodName))
+							as EnvDTE.CodeFunction;
+
+	if (mapFrom != null)
+    {
+		exClass.RemoveMember(methodName);
+		mapFrom = null;
+    }
+
+	if(mapFrom == null)
+    {
+		mapFrom = exClass.AddFunction(methodName, EnvDTE.vsCMFunction.vsCMFunctionFunction, derivedClass.FullName, -1, EnvDTE.vsCMAccess.vsCMAccessPublic, null);
+		var param1 = mapFrom.AddParameter("derived", derivedClass.FullName, -1);
+		var param2 = mapFrom.AddParameter("source", sourceClass.FullName, -1);
+
+		// set this as extension method
+		mapFrom.IsShared = true;
+		param1.StartPoint.CreateEditPoint().Insert("this ");
+		EnvDTE.EditPoint ep = mapFrom.GetStartPoint(EnvDTE.vsCMPart.vsCMPartBody).CreateEditPoint();
+		ep.Insert("// this function is auto-generated by DerivedModel.tt");		
+		ep.Insert(Environment.NewLine);
+		ep.Insert("// you can add your code in MannuallyFrom");		
+		ep.Insert(Environment.NewLine);
+		foreach(var dp in derivedProperties)
+        {
+			foreach(var sp in sourceProperties)
+            {
+				// if(!dp.FullName.EndsWith(derivedClass.Name + "." + dp.Name))
+				//	continue;
+
+				if(dp.Name != sp.Name)
+					continue;
+
+				if(!IsSettable(dp))
+					continue;
+				
+				if(!IsGettable(sp))
+					continue;
+
+				if(sp.Name == "Entity")
+					continue;
+
+				if(dp.Type.AsFullName == sp.Type.AsFullName)
+                {
+					ep.Insert(string.Format("derived.{0} = source.{1};", dp.Name, sp.Name));
+                }
+				else if(dp.Type.AsFullName.StartsWith("System.Collections.Generic.List"))
+                {
+					ep.Insert(string.Format("derived.{0} = source.{1}?.Select({2}Ex.To{3}).ToList();", dp.Name, sp.Name, GetGenericTypeParameterFullName(dp.Type.AsFullName), GetGenericTypeParameterName(dp.Type.AsFullName)));
+                }
+				else
+				{
+					ep.Insert(string.Format("derived.{0} = source.{1}?.To{2}();", dp.Name, sp.Name, dp.Type.CodeType.Name));
+                }
+				ep.Insert(Environment.NewLine);
+            }
+        }
+		ep.Insert(Environment.NewLine);
+		ep.Insert("derived.MannuallyFrom(source);");
+		ep.Insert(Environment.NewLine);
+		ep.Insert("return derived;");		
+    }
+}
+
+void CreateMapTo(EnvDTE.CodeClass exClass, EnvDTE80.CodeClass2 derivedClass, IEnumerable<EnvDTE.CodeProperty> derivedProperties, EnvDTE80.CodeClass2 sourceClass, IEnumerable<EnvDTE.CodeProperty> sourceProperties)
+{
+	var methodName = "MapTo";
+	var mapTo = VisualStudioHelper.CodeModel.GetAllMethods(exClass)
+							.FirstOrDefault(f => f.FullName.EndsWith(exClass.Name + "." + methodName))
+							as EnvDTE.CodeFunction;
+
+	if (mapTo != null)
+    {
+		exClass.RemoveMember(methodName);
+		mapTo = null;
+    }
+
+	if(mapTo == null)
+    {
+		mapTo = exClass.AddFunction(methodName, EnvDTE.vsCMFunction.vsCMFunctionFunction, sourceClass.FullName, -1, EnvDTE.vsCMAccess.vsCMAccessPublic, null);
+		var param1 = mapTo.AddParameter("derived", derivedClass.FullName, -1);
+		var param2 = mapTo.AddParameter("source", sourceClass.FullName, -1);
+
+		// set this as extension method
+		mapTo.IsShared = true;
+		param1.StartPoint.CreateEditPoint().Insert("this ");
+		EnvDTE.EditPoint ep = mapTo.GetStartPoint(EnvDTE.vsCMPart.vsCMPartBody).CreateEditPoint();
+		ep.Insert("// this function is auto-generated by DerivedModel.tt");		
+		ep.Insert(Environment.NewLine);
+		ep.Insert("// you can add your code in MannuallyTo");		
+		ep.Insert(Environment.NewLine);
+		foreach(var dp in derivedProperties)
+        {
+			foreach(var sp in sourceProperties)
+            {
+				//if(!dp.FullName.EndsWith(derivedClass.Name + "." + dp.Name))
+				//	continue;
+
+				if(dp.Name != sp.Name)
+					continue;
+
+				if(!IsSettable(sp))
+					continue;
+				
+				if(!IsGettable(dp))
+					continue;
+				
+				if(sp.Name == "Entity")
+					continue;
+
+				if(dp.Type.AsFullName == sp.Type.AsFullName)
+                {
+					ep.Insert(string.Format("source.{0} = derived.{1};", sp.Name, dp.Name));
+                }
+				else if(dp.Type.AsFullName.StartsWith("System.Collections.Generic.List"))
+                {
+					ep.Insert(string.Format("source.{0} = derived.{1}?.Select({2}Ex.To{3}).ToList();", sp.Name, dp.Name, GetGenericTypeParameterFullName(dp.Type.AsFullName), GetGenericTypeParameterName(sp.Type.AsFullName)));
+                }
+				else
+				{
+					ep.Insert(string.Format("source.{0} = derived.{1}?.To{2}();", sp.Name, dp.Name, sp.Type.CodeType.Name));
+                }
+				ep.Insert(Environment.NewLine);
+            }
+        }
+		ep.Insert(Environment.NewLine);
+		ep.Insert("derived.MannuallyTo(source);");
+		ep.Insert(Environment.NewLine);
+		ep.Insert("return source;");		
+    }
+}
+
+bool IsGettable(EnvDTE.CodeProperty prop)
+{
+    try 
+    {	        
+		return prop.Access == EnvDTE.vsCMAccess.vsCMAccessPublic && prop.Getter != null;
+    }
+    catch
+    {
+		return false;
+    }
+}
+
+bool IsSettable(EnvDTE.CodeProperty prop)
+{
+	try 
+    {	        
+		return prop.Access == EnvDTE.vsCMAccess.vsCMAccessPublic && prop.Setter != null;
+    }
+    catch
+    {
+		return false;
+    }
+}
+
+string GetGenericTypeParameterFullName(string typeFullName)
+{
+	return typeFullName.Split('<','>')[1];
+}
+
+string GetGenericTypeParameterName(string typeFullName)
+{
+	var fullname = GetGenericTypeParameterFullName(typeFullName);
+	return fullname.Split('.').Last();
+}
+#>
